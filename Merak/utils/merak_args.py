@@ -102,9 +102,9 @@ class MerakArguments(TrainingArguments):
     Using [`HfArgumentParser`] we can turn this class into [argparse](https://docs.python.org/3/library/argparse#module-argparse) 
     arguments that can be specified on the command line.
     Parameters:
-    -   train_schedule (str, Optional,  defaults to '1f1b') -- Some possible choices are the pipe schedules as strings: '1f1b', 'ds_default','last_no_recompute_1f1b', 'shifted_critical_path'.
-    -   partition_method (str, Optional, defaults to 'uniform') -- Possible choices are the pipeline layer partion strategy as strings: 
-        'uniform','uniform_floor','parameters'.
+    -   train_schedule (str, Optional,  defaults to '1f1b') -- Some possible choices are the pipe schedules as strings: '1f1b', 'ds_default', 'early_recompute_1f1b', 'last_no_recompute_1f1b', 'shifted_critical_path', 'instruction_profile'.
+    -   partition_method (str, Optional, defaults to 'uniform_transformer') -- Possible choices are the pipeline layer partion strategy as strings: 
+        'uniform','uniform_floor','parameters','uniform_transformer','custom:'.
     -   init_method_std (float, defaults to 0.02) -- Standard deviation of the zero mean normal distribution used for tp weight initialization in Megatron
     -   activation_checkpointing (bool, defaults to True) -- Whether to use activation checkpointing. 
     -   checkpoint_num_layers (int, defaults to 1) -- Chunk size (number of layers) for checkpointing.
@@ -137,21 +137,29 @@ class MerakArguments(TrainingArguments):
     -   loss_scale_window (int, defaults to 1000) -- 'loss_scale_window is a fp16 parameter representing the window over which to raise/lower the dynamic loss scale value.'
     -   hysteresis (int, defaults to 2) -- 'hysteresis is a fp16 parameter representing the delay shift in dynamic loss scaling.'
     -   min_loss_scale (int, defaults to 1) -- 'min_loss_scale is a fp16 parameter representing the minimum dynamic loss scale value.'
+
+    -   perseus_url (str, defaults to 'http://127.0.0.1:7787') -- 'Perseus server URL.'
+    -   model_name (str, defaults to '') -- 'Name of the DNN being trained.'
+    -   num_warmup_steps (int, defaults to 5) -- 'How many warmup steps to run in profiling mode'
+    -   num_prof_steps (int, defaults to 30) -- 'How many steps to measure'
+    -   num_transformers (int, defaults to 0) -- 'The number of transformer encoder/decoder layers in the model'
+    -   num_initial_embeddings (int, default to 0) -- 'The number of initial embedding layers before transformer layers'
+    -   profile (int, defaults to False) -- 'Whether the engine should run in instruction profiling mode'
     """
 
     train_schedule: str = field(
         default="1f1b",
         metadata={
-            "help": "Possible choices are the pipe schedules as strings: `1f1b`, `ds_default`, `pre_recompute_1f1b`, "
-                    "`ds_default`,  `last_no_recompute_1f1b`, `full_critical_path_1f1b, shifted_critical_path`,"
+            "help": "Possible choices are the pipe schedules as strings: `1f1b`, `ds_default`, `early_recompute_1f1b`, "
+                    "`ds_default`,  `last_no_recompute_1f1b`, `full_critical_path_1f1b`, `shifted_critical_path`, `instruction_profiler`"
                     " Defaults to `1f1b`.",
         },
     )
     partition_method: str = field(
-        default="uniform",
+        default="uniform_transformer",
         metadata={
             "help": "Possible choices are the pipeline layer partion strategy as strings: 'uniform','uniform_floor',"
-                    "'parameters'. Defaults to 'uniform'.",
+            "'parameters','uniform_transformer','custom:'. Defaults to 'uniform_transformer'.",
         },
     )
     init_method_std: float = field(
@@ -180,8 +188,12 @@ class MerakArguments(TrainingArguments):
         metadata={"help": "The maximum sequence length that this model might ever be used with, will try to get this in model config. Defaults to None."}
     )
     wall_clock_breakdown: bool = field(
+        default=True,
+        metadata={"help": "Whether to record detailed time spend for each instruction on each rank. Defaults to True"},
+    )
+    print_details: bool = field(
         default=False,
-        metadata={"help": "Whether to log detail time spend on each rank. Defaults to False"},
+        metadata={"help": "Whether to print out model and engine details for debugging. Defaults to False"},
     )
     shard_count: Optional[int] = field(
         default=None, 
@@ -196,12 +208,12 @@ class MerakArguments(TrainingArguments):
         metadata={"help": 'Gradient predivide factor in gradient prescaling. Defaults to 1'}
     )
     cache_sharding: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to cache the partitioned graphs of model with microbatch size. Defaults to False"},
     )
-    cache_name: Optional[str] = field(
+    cache_dir: Optional[str] = field(
         default=None, 
-        metadata={"help": "Set the cache name of partitioned graphs, must be setted when cache_sharding is True."}
+        metadata={"help": "Set the cache name of partitioned graphs, must be set when cache_sharding is True."}
     )
     return_logits: bool = field(
         default=False,
@@ -241,7 +253,7 @@ class MerakArguments(TrainingArguments):
         metadata={"help": "Whether to split input data"}
     )
     parallel_vocab: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether to parallel vocabulary when TMP > 1"}
     )
 
@@ -283,6 +295,34 @@ class MerakArguments(TrainingArguments):
     min_loss_scale: int = field(
         default=1,
         metadata={"help": 'min_loss_scale is a fp16 parameter representing the minimum dynamic loss scale value.'}
+    )
+    perseus_url: str = field(
+        default="http://localhost:7787",
+        metadata={"help": 'Perseus server URL'}
+    )
+    model_name: str = field(
+        default="",
+        metadata={"help": "Name of the DNN being trained."}
+    )
+    num_warmup_steps: int = field(
+        default=5,
+        metadata={"help": "How many warmup steps to run in profiling mode"}
+    )
+    num_prof_steps: int = field(
+        default=30,
+        metadata={"help": "How many steps to measure."}
+    )
+    num_transformers: int = field(
+        default=0,
+        metadata={"help": "The number of transformer layers in the model"}
+    )
+    num_initial_embeddings: int = field(
+        default=0,
+        metadata={"help": "The number of initial embedding layers before transformer layers"}
+    )
+    profile: bool = field(
+        default=False,
+        metadata={"help": "Whether the engine should run in instruction profiling mode"}
     )
 
 

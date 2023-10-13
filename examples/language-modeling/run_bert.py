@@ -17,58 +17,64 @@
 
 # using our distributed trainer
 import Merak
-from Merak import MerakArguments, MerakTrainer, print_rank_0
-from utils import create_tokenizer, load_data, preprocessing_datasets
-from config import load_config
+from Merak import MerakArguments, MerakTrainer
+from utils import create_tokenizer, preprocessing_datasets, load_wikitext
+from config import load_config_and_model
 
 from transformers import (
     DataCollatorForLanguageModeling,
     set_seed,
-    BertForMaskedLM,
-    BertConfig,
     HfArgumentParser,
 )
 
 
 def parse_option(parser):
     # easy config modification
-    parser.add_argument('--data-files', type=str, help='path to dataset')
-    parser.add_argument('--cache-dir', type=str, help='where to save cache')
-    parser.add_argument('--dataset-name', type=str, help='name of dataset from the datasets package')
-    parser.add_argument('--model-name', type=str, help='gpt2 or t5-base')
     parser.add_argument('--validation-split-percentage', type=int, default=5, help='split data for validation')
+    parser.add_argument('--pp', type=int, default=4, help='Pipeline parallel degree')
+    parser.add_argument('--tp', type=int, default=1, help='Tensor parallel degree')
+    parser.add_argument('--dp', type=int, default=1, help='Data parallel degree')
 
     return parser
 
 def main():
-    # init dist
-    pp = 2
-    tp = 1
-    dp = 2
-    Merak.init(pp, tp, dp)
-    
+    # merge args
     hfparser = HfArgumentParser(MerakArguments)
     parser = parse_option(hfparser)
     training_args, args = parser.parse_args_into_dataclasses()
 
+    # init dist
+    pp = args.pp
+    tp = args.tp
+    dp = args.dp
+    Merak.init(pp=pp, tp=tp, dp=dp)
+    
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
     # create dataset
-    raw_datasets = load_data(args.data_files, args.cache_dir, args.validation_split_percentage)
+    raw_datasets = load_wikitext(training_args.cache_dir, args.validation_split_percentage)
 
-    # set model config
-    config_kwarg = load_config(args.model_name)
-    config = BertConfig(**config_kwarg)
+    # Load model config and instantiate model.
+    config, model = load_config_and_model(training_args.model_name)
+
+    # Set `shard_count` based on number of layers
+    # bert-base-uncased  => 14 layers (embedding, 12 transformer encoders, lm_head)
+    # bert-large-uncased => 26 layers (embedding, 24 transformer encoders, lm_head)
+    training_args.shard_count = 1 + config.num_hidden_layers + 1
+    training_args.num_transformers = config.num_hidden_layers
+    training_args.num_initial_embeddings = 1
+
+    # Hard code envpipe reschedule forward counts. It'll only be used when envpipe is enabled.
+    # These numbers are for single node four stage A40.
+    training_args.envpipe_reschedule_cnt = [6, 4, 2, 0]
 
     # create tokenizer
-    tokenizer = create_tokenizer(args.cache_dir, args.model_name, config)
-
-    model = BertForMaskedLM(config)
+    tokenizer = create_tokenizer(training_args.cache_dir, training_args.model_name, config)
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
-    train_dataset, eval_dataset = preprocessing_datasets(raw_datasets, tokenizer, args.model_name)
+    train_dataset, eval_dataset = preprocessing_datasets(raw_datasets, tokenizer, training_args.model_name)
 
     # Data collator
     # This one will take care of randomly masking the tokens.
@@ -89,10 +95,14 @@ def main():
         data_collator=data_collator,
     )
 
-    # Training
-    train_result = trainer.train()
-    metrics = train_result.metrics
-    trainer.log_metrics("train", metrics)
+    # Train or profile
+    if training_args.profile:
+        trainer.profile()
+    else:
+        train_result = trainer.train()
+        if train_result is not None:
+            metrics = train_result.metrics
+            trainer.log_metrics("train", metrics)
 
 
 if __name__ == "__main__":

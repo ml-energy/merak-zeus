@@ -16,17 +16,23 @@
 # limitations under the License.
 
 import os
+import time
+from typing import cast
+from itertools import chain
 import torch
+import pynvml
 import torchvision
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 import gc
 import importlib
 import warnings
+import csv
 
 from . import print_rank_0, get_grid, get_topo, get_patched_func
 from . import mpu
 from .mpu.initialize import _set_random_seed
+from .mpu.topology import PipelineParallelGrid
 
 from .modules.utils import get_params_for_weight_decay_optimization
 from .modules.module import PipelineModule
@@ -37,6 +43,7 @@ from .modules.mp_layers import ColPara
 from .runtime.utils import see_memory_usage
 from .runtime.checkpointing import checkpoint as checkpoint_func
 from .runtime.pipe_engine import PipelineEngine
+from .runtime.schedule import ProfileSchedule
 
 from .utils.merak_args import mergeargs, MerakArguments, manual_set_args
 from .utils.dataloader import MegatronPretrainingRandomSampler
@@ -49,14 +56,18 @@ from .train_func import train
 
 import transformers
 import datasets
+from transformers.utils import logging
 from transformers.modeling_utils import PreTrainedModel, unwrap_model
 from transformers.file_utils import is_datasets_available
-from transformers import Trainer
+from transformers.trainer import Trainer
 from transformers.trainer_pt_utils import (
     IterableDatasetShard,
 )
 
+from zeus.monitor import ZeusMonitor
 
+
+logger = logging.get_logger(__name__)
 
 class MerakTrainer(Trainer):
     def __init__(self, leaf_modules=(), loss_fn=torch.nn.CrossEntropyLoss(), **kwargs):
@@ -96,6 +107,14 @@ class MerakTrainer(Trainer):
             n_layer = recursive_find_sequantial(kwargs['model'], 0)
             kwargs['args'].num_layers = n_layer if n_layer > 0 else None
         super().__init__(**kwargs)
+
+        # Manage graph sharding cache
+        if self.args.cache_sharding:
+            assert self.args.cache_dir is not None
+            self.args.cache_dir += "/graph_cache"
+            os.makedirs(self.args.cache_dir, exist_ok=True)
+            # Merak.autoshard will use this path prefix as a key to caching & retrieving graph shards.
+            self.args.cache_dir += f"/mbs{self.args.per_device_train_batch_size}"
 
         self.args.torch_ddp = False
         # Merge duplicate parameters
@@ -178,7 +197,7 @@ class MerakTrainer(Trainer):
             f'model {self.model.__class__.__name__} is not supported by auto tp now, should set tp attr manually with set_tp_layer_lists'
             self.model = set_mp_attr(self.model, self.mp)
         
-        if self.args.wall_clock_breakdown: 
+        if self.args.print_details: 
             print_rank_0(self.model)
 
         emb_dim = set()
@@ -211,6 +230,7 @@ class MerakTrainer(Trainer):
                 self.args.input_names=list(trace_batch.keys())
             del self.iter_dataloader
 
+        logger.info("Start tracing and sharding model. This may take a while especially if the model islarge.")
         model, model_layers, input_to_shard_dic = convert_to_sequential(self.model, self.args, self.leaf_modules)
         self.model_name = self.model._get_name()
 
@@ -292,12 +312,12 @@ class MerakTrainer(Trainer):
 
         pipe_model.tie_modules()
 
-        if self.args.wall_clock_breakdown and mpu.get_data_parallel_rank() == 0 and mpu.get_model_parallel_rank() == 0:
+        if self.args.print_details and mpu.get_data_parallel_rank() == 0 and mpu.get_model_parallel_rank() == 0:
             print(dist.get_rank(), pipe_model.stage_id, pipe_model)
         torch.cuda.empty_cache()
         # see_memory_usage('**** \n memory consumption after deepspeep init ', force=True)
 
-        if self.args.wall_clock_breakdown: 
+        if self.args.print_details: 
             print_rank_0(pipe_model._topo)
             
         param_groups = get_params_for_weight_decay_optimization(pipe_model)
@@ -318,6 +338,7 @@ class MerakTrainer(Trainer):
                             "steps_per_print": self.args.logging_steps,
                             "gradient_clipping": self.args.max_grad_norm,
                             "wall_clock_breakdown": self.args.wall_clock_breakdown,
+                            "print_details": self.args.print_details,
                             "prescale_gradients": self.args.prescale_gradients,
                             "gradient_predivide_factor": self.args.gradient_predivide_factor,
                             }
@@ -346,10 +367,10 @@ class MerakTrainer(Trainer):
         self.model = self.pipe_model
         self.model.config = hf_config
         
-    def training_step(self, iter_dataloader):
+    def training_step(self, iter_dataloader, return_loss: bool = True):
 
-        loss = self.pipe_model.train_batch(iter_dataloader)
-        return loss.detach()
+        loss = self.pipe_model.train_batch(iter_dataloader, return_loss=return_loss)
+        return loss.detach() if return_loss else None
 
 
     def do_prediction(self):
@@ -454,6 +475,8 @@ class MerakTrainer(Trainer):
 
     def _prepare_inputs(self, data):
         if not isinstance(data, (tuple, list)):
+            if isinstance(data, transformers.BatchEncoding):
+                data = data.data
             if isinstance(data, dict):
                 inputs = self._prepare_input(data)
                 inputs_list = []
@@ -592,6 +615,196 @@ class MerakTrainer(Trainer):
     def save_to_checkpoint(self):
         kwargs = None
         save_checkpoint(self.state.global_step, self.pipe_model, self.optimizer, self.lr_scheduler, self.args, **kwargs)
+
+
+    def profile(self):
+        """Alternative Trainer entrypoint to profile the time/energy consumption of each instruction."""
+        global_rank = dist.get_rank()
+
+        if self.args.gradient_accumulation_steps != 1:
+            raise ValueError("Profiling mode expects --gradient_accumulation_steps to be 1.")
+
+        self.args.train_schedule = "instruction_profiler"
+        if global_rank == 0:
+            logger.info("Setting train_schedule to '%s'", self.args.train_schedule)
+
+        self.create_optimizer_and_scheduler(num_training_steps=100000)
+        
+        if global_rank == 0:
+            logger.info("Gradient checkpointing is %s", "enabled" if self.args.gradient_checkpointing else "disabled")
+        if self.args.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+
+        model = self._wrap_model(self.model_wrapped)
+        if model is not self.model:
+            self.model_wrapped = model
+
+        self.len_dataset = None
+        self._get_iter_dataloader()
+
+        profile_start_time = time.time()
+        if global_rank == 0:
+            logger.info("***** Running profiling *****")
+            logger.info(f"  Num warmup steps = {self.args.num_warmup_steps}")
+            logger.info(f"  Num profile steps = {self.args.num_prof_steps}")
+            logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
+
+        # Initialize NVML.
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(self.args.local_rank)
+        # Fetch the feasible range of frequencies.
+        max_mem_freq = max(pynvml.nvmlDeviceGetSupportedMemoryClocks(handle))
+        frequency_range = sorted(pynvml.nvmlDeviceGetSupportedGraphicsClocks(handle, max_mem_freq), reverse=True)
+
+        # Prepare stuff
+        model.zero_grad()
+        self._reset_dataloader(0)
+
+        # Cache the original `ProfileSchedule` instance.
+        train_sched = self.pipe_model.train_sched
+        assert isinstance(train_sched, ProfileSchedule)
+
+        # Run one full training step (RecvAct -> Forward -> SendAct -> RecvGrad -> Backward -> SendGrad)
+        # to fill up the input, output, and label buffers with real data.
+        # PipeEngine knows that we're in profiling mode, and it does not deallocate buffers.
+        if global_rank == 0:
+            logger.info("Running one full training step to fill buffers")
+        num_insts = len(list(chain.from_iterable(train_sched.buffer_fill_steps())))
+        self.pipe_model.train_sched = train_sched.buffer_fill_steps()  # type: ignore
+        self.pipe_model.train_power_state_schedule = [frequency_range[0]] * num_insts
+        dist.barrier()
+        self.training_step(self.iter_dataloader)
+
+        # Reduce the chances of CUDA OOM.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Profile backward
+        logger.info("[Rank %s] Backward profiling", global_rank)
+        backward_time, backward_energy = self._run_instruction_profiling(
+            global_rank,
+            "backward",
+            train_sched.backward_steps,
+            frequency_range,
+            handle,
+        )
+
+        # Reduce the chances of CUDA OOM.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Profile forward
+        logger.info("[Rank %s] Forward profiling", global_rank)
+        forward_time, forward_energy = self._run_instruction_profiling(
+            global_rank,
+            "forward",
+            train_sched.forward_steps,
+            frequency_range,
+            handle,
+        )
+
+        logger.info("[Rank %s] Profiling done!", global_rank)
+
+        dist.barrier()
+
+        # Gather results into rank 0
+        grid = cast(PipelineParallelGrid, get_grid())
+        records = []
+        headers = [
+            "rank", "dp_rank", "pp_rank", "tp_rank",
+            "stage", "instruction", "frequency", "time", "energy",
+        ]
+        prefix = (
+            global_rank,
+            grid.get_data_parallel_rank(),
+            grid.get_pipe_parallel_rank(),
+            grid.get_slice_parallel_rank(),
+            grid.get_pipe_parallel_rank(),
+        )
+        for freq in forward_time.keys():
+            records.append((*prefix, "forward", freq, forward_time[freq], forward_energy[freq]))
+        for freq in backward_time.keys():
+            records.append((*prefix, "backward", freq, backward_time[freq], backward_energy[freq]))
+
+        gather_buffer = [None] * dist.get_world_size()
+        dist.all_gather_object(object_list=gather_buffer, obj=records)
+
+        profile_took = time.time() - profile_start_time
+
+        # Dump as CSV.
+        if global_rank == 0:
+            filepath = (
+                f"merak+{self.args.model_name}+{self.args.partition_method}"
+                f"+dp{self.dp}+pp{self.pp}+tp{self.mp}"
+                f"+mbs{self.args.per_device_train_batch_size}"
+                ".csv"
+            )
+            all_records = sum(gather_buffer, [])
+            all_records.sort(key=lambda obj: obj[0])  # Sort by rank.
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(all_records)
+            logger.info("Saved profiling results to %s", filepath)
+            logger.info("Profiling took %s seconds", profile_took)
+
+        # Cleanup
+        pynvml.nvmlDeviceResetGpuLockedClocks(handle)
+        pynvml.nvmlShutdown()
+        time.sleep(3.0)
+
+    def _run_instruction_profiling(
+        self,
+        rank,
+        inst_name,
+        train_sched_method,
+        frequency_range,
+        handle,
+    ) -> tuple[dict[int, float], dict[int, float]]:
+        time_dict = {}
+        energy_dict = {}
+        prev_energy = None
+        increased_energy_count = 0
+        monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
+
+        for i, freq in enumerate(frequency_range):
+            # Set GPU frequency
+            pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
+            logger.info("[Rank %d %s] frequency = %s MHz", rank, inst_name, freq)
+
+            # Warmup steps
+            num_insts = len(list(chain.from_iterable(train_sched_method(self.args.num_warmup_steps))))
+            self.pipe_model.train_sched = train_sched_method(self.args.num_warmup_steps)
+            self.pipe_model.train_power_state_schedule = [freq] * num_insts
+            self.training_step(self.iter_dataloader, return_loss=False)
+
+            # Real profiling steps
+            num_insts = len(list(chain.from_iterable(train_sched_method(self.args.num_prof_steps))))
+            self.pipe_model.train_sched = train_sched_method(self.args.num_prof_steps)
+            self.pipe_model.train_power_state_schedule = [freq] * num_insts
+            monitor.begin_window("instuction")
+            self.training_step(self.iter_dataloader, return_loss=False)
+            mes = monitor.end_window("instuction")
+
+            # Record
+            time_dict[freq] = mes.time / self.args.num_prof_steps  # seconds
+            curr_energy = energy_dict[freq] = mes.total_energy / self.args.num_prof_steps  # Joules
+
+            # Stop profiling when energy definitely starts to increase.
+            # After this point, the all frequencies will be Pareto-suboptimal.
+            # Some heuristics to make sure it doesn't screw up -- only stop if
+            # we've went through at least half of the frequencies, and we've
+            # seen at least 5 consecutive increases.
+            if i > len(frequency_range) // 2 and prev_energy is not None and curr_energy > prev_energy:
+                increased_energy_count += 1
+                if increased_energy_count >= 5:
+                    break
+            else:
+                increased_energy_count = 0
+
+            prev_energy = curr_energy
+        
+        return time_dict, energy_dict
 
 
 # monkey patch for train function

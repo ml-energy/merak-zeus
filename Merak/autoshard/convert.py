@@ -87,23 +87,24 @@ def convert_to_sequential(model, args, extra_leaf_modules=(), trace_batch=None):
     # print_rank_0(transformers_fx_models)
     if not args.fp16:
         model.cpu()
+
+    if args.cache_sharding:
+        assert args.cache_dir is not None
+        if os.path.isfile(f'{args.cache_dir}_graph0_cache.pt'):
+            cache_dir = os.path.split(f'{args.cache_dir}_graph0_cache.pt')[0]
+            result_len = len([n for n in os.listdir(cache_dir) if args.cache_dir.split("/")[-1] + '_graph' in n])
+            result = []
+            for i in range(result_len):
+                graph_slice = torch.load(f'{args.cache_dir}_graph{i}_cache.pt')
+                result.append(graph_slice)
+                del graph_slice
+            input_to_shard = torch.load(f'{args.cache_dir}_input_cache.pt')
+
+            print_rank_0(f"Retrieved cached graphs from {args.cache_dir}")
+
+            return model, result, input_to_shard
+
     if isinstance(model, transformers_fx_models):
-
-
-        if args.cache_sharding:
-            assert args.cache_name is not None
-            if os.path.isfile(f'{args.cache_name}_graph0_cache.pt'):
-                cache_dir = os.path.split(f'{args.cache_name}_graph0_cache.pt')[0]
-                result_len = len([n for n in os.listdir(cache_dir) if 'graph' in n])
-                result = []
-                for i in range(result_len):
-                    graph_slice = torch.load(f'{args.cache_name}_graph{i}_cache.pt')
-                    result.append(graph_slice)
-                    del graph_slice
-                input_to_shard = torch.load(f'{args.cache_name}_input_cache.pt')
-
-                return model, result, input_to_shard
-
         traced, dummy_inputs = symbolic_trace(
             model,
             input_names = args.input_names,
@@ -155,15 +156,15 @@ def convert_to_sequential(model, args, extra_leaf_modules=(), trace_batch=None):
     if args.half_precision_backend != "apex":
         torch.cuda.synchronize()
 
-    if args.cache_sharding and isinstance(model, transformers_fx_models):
-        if dist.get_rank() == 0:
-            file_path = os.path.abspath(os.path.dirname(args.cache_name))
+    if args.cache_sharding:
+        if args.local_rank == 0:
+            file_path = os.path.abspath(os.path.dirname(args.cache_dir))
             if not os.path.exists(file_path):
                 os.makedirs(file_path)
             for idx, graph in enumerate(result):
-                # graph.to_folder(f'{args.cache_name}', f'module_{idx}')
-                torch.save(graph, f'{args.cache_name}_graph{idx}_cache.pt')
-            torch.save(input_to_shard, f'{args.cache_name}_input_cache.pt')
+                # graph.to_folder(f'{args.cache_dir}', f'module_{idx}')
+                torch.save(graph, f'{args.cache_dir}_graph{idx}_cache.pt')
+            torch.save(input_to_shard, f'{args.cache_dir}_input_cache.pt')
             dist.barrier()
         else:
             dist.barrier()

@@ -40,14 +40,16 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
 # Fields marked as "Optional" may be commented out.
 
 install_requires = [
-    'torch>=1.10.0',
-    'torchvision>=0.11.1',
+    'torch==1.10.1',
+    'torchvision==0.11.2',
     'transformers==4.15.0',
     'python-dateutil>=2.1',
     'psutil',
     'tensorboardX>=1.8',
     'datasets==2.0.0',
     'huggingface-hub==0.1.2',
+    'yacs',
+    'timm==0.6.12',
 ]
 
 ext_cpp_modules_path = path.join(here, 'Merak/utils/csrc')

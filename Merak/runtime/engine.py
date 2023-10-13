@@ -22,6 +22,7 @@ from .utils import see_memory_usage, clip_grad_norm_
 from .config import DeepSpeedConfig
 from ..utils import logger, log_dist
 from ..utils.timer import ThroughputTimer, SynchronizedWallClockTimer
+from ..utils.merak_args import get_args
 from ..modules.module import PipelineModule
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -221,6 +222,9 @@ class DeepSpeedEngine(Module):
             return torch.float16
 
         return torch.float32
+
+    def print_details(self):
+        return self._config.print_details
 
     def wall_clock_breakdown(self):
         return self._config.wall_clock_breakdown
@@ -599,9 +603,11 @@ class DeepSpeedEngine(Module):
         #     if not self.is_gradient_accumulation_boundary():
         #         self.scaler.scale(loss).backward()
         elif self.fp16_enabled():
-            self.optimizer.backward(loss)
+            self.optimizer.backward(loss, retain_graph=get_args().profile)
         else:
-            loss.backward()
+            # In instruction profiling mode, we need to retain the graph in order to run
+            # multiple backward passes back to back.
+            loss.backward(retain_graph=get_args().profile)
 
         if self.wall_clock_breakdown():
             self.timers('backward_inner').stop()

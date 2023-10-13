@@ -24,14 +24,19 @@ import os
 
 from types import MethodType
 from inspect import isgenerator
+from itertools import chain
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 
+from zeus.callback import CallbackSet
+from zeus.optimizer.perseus import PerseusOptimizer
+
 from ..utils.logging import logger
 from ..utils.timer import SynchronizedWallClockTimer, ThroughputTimer, set_timer_log_rank
+from ..utils.merak_args import get_args
 
 from .engine import DeepSpeedEngine, MEMORY_OPT_ALLREDUCE_SIZE
 
@@ -39,6 +44,7 @@ from ..modules.module import PipelineModule, PipelineError
 from .. import mpu, print_rank_0
 from . import schedule
 from ..mpu.p2p_communication import recv_forward, send_backward, recv_backward, send_forward, send_forward_recv_backward, send_backward_recv_forward
+from ..mpu.topology import PipelineParallelGrid
 
 from .checkpointing import pre_checkpoint as pre_checkpoint_func
 from .checkpointing import RNGManager
@@ -90,7 +96,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.micro_batches = self.gradient_accumulation_steps()
 
         # Set Grid and Communication Groups
-        self.grid = self.module._grid
+        self.grid: PipelineParallelGrid = self.module._grid
         if self.grid.get_global_rank() == 0:
             logger.info(f'CONFIG: micro_batches={self.micro_batches} '
                         f'micro_batch_size={self.micro_batch_size}')
@@ -128,10 +134,12 @@ class PipelineEngine(DeepSpeedEngine):
             TrainScheduleClass = schedule.MergeP2PTrainSchedule
         elif self.train_schedule == 'ds_default':
             TrainScheduleClass = schedule.TrainSchedule
+        elif self.train_schedule == "instruction_profiler":
+            TrainScheduleClass = schedule.ProfileSchedule
         else:
             # if not self.is_last_stage():
             #     assert self.module.activation_checkpoint_interval > 0, 'should use checkpoint layer'
-            if self.train_schedule == 'pre_recompute_1f1b':
+            if self.train_schedule == 'early_recompute_1f1b':
                 TrainScheduleClass = schedule.PreRecomputeTrainSchedule
             elif self.train_schedule == 'last_no_recompute_1f1b':
                 if self.is_last_stage():
@@ -152,6 +160,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.train_sched = TrainScheduleClass(micro_batches=self.micro_batches,
                                        stages=self.num_stages,
                                        stage_id=self.stage_id)
+        # self.train_power_state_schedule = [0 for _ in chain.from_iterable(self.train_sched)]
 
         self.activation_checkpoint_interval_backup = self.module.activation_checkpoint_interval
 
@@ -201,6 +210,11 @@ class PipelineEngine(DeepSpeedEngine):
             'outputs' : [],  # activations
             'extra_inputs' : [],
             # 'output_tensors' : [], # tensor object to preserve backward graph
+            'losses': [],  # Instead of overwriting `self.loss` in _exec_backward_pass for the last stage,
+                           # save the losses in the pipe buffer. This way, the last stage can do multiple
+                           # forwards before doing any backward. Previously, both DeepSpeed and Merak wrongly
+                           # assumed that the last stage will only repeat one-forward-one-backward, which may
+                           # not be the case for some pipeline schedules.
         }
         self.pipe_recv_buf = None
         self.grad_layer = None
@@ -212,9 +226,6 @@ class PipelineEngine(DeepSpeedEngine):
 
         self.rng_manager = RNGManager()
 
-        #stores the loss for the current micro batch being processed
-        self.loss = torch.tensor(0.0).to(self.device)
-
         #stores the loss for the entire batch
         self.total_loss = None
         self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
@@ -225,16 +236,20 @@ class PipelineEngine(DeepSpeedEngine):
             self.loss_model = self.module.loss_fn
 
         # Initialize pipeline communicators. Just send a 0.
+        zero = torch.tensor(0.0).to(self.device)
         if is_even(self.stage_id):
             if not self.is_last_stage():
-                send_forward(self.loss)
+                send_forward(zero)
             if not self.is_first_stage():
-                recv_forward(self.loss)
+                recv_forward(zero)
         else:
             if not self.is_first_stage():
-                recv_forward(self.loss)
+                recv_forward(zero)
             if not self.is_last_stage():
-                send_forward(self.loss)
+                send_forward(zero)
+
+        # When we're doing instruction profiling, we don't want to free buffers.
+        self.is_profiling = get_args().profile
 
         # XXX look into timer reporting timing
         # Initialize some timers because of early weirdness.
@@ -251,6 +266,35 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers('backward_allreduce').stop()
             self.timers('step_microstep').start()
             self.timers('step_microstep').stop()
+
+        # The PerseusOptimizer communicates with ther server and helps set the
+        # GPU's frequency based on energy scheduling results.
+        if not self.is_profiling:
+            args = get_args()
+            job_metadata = "+".join(
+                [
+                    args.model_name,
+                    args.train_schedule,
+                    f"mbs{args.per_device_train_batch_size}",
+                    f"nmb{args.gradient_accumulation_steps}",
+                ]
+            )
+            self.perseus_optimizer = PerseusOptimizer(
+                rank=self.global_rank,
+                dp_rank=self.grid.get_data_parallel_rank(),
+                pp_rank=self.grid.get_pipe_parallel_rank(),
+                tp_rank=self.grid.get_slice_parallel_rank(),
+                device_id=torch.cuda.current_device(),
+                dp_degree=self.grid.get_data_parallel_world_size(),
+                pp_degree=self.grid.get_pipe_parallel_world_size(),
+                tp_degree=self.grid.get_slice_parallel_world_size(),
+                world_size=dist.get_world_size(),
+                server_url=args.perseus_url,
+                job_metadata=job_metadata,
+            )
+        else:
+            # This is effectively a no-op.
+            self.perseus_optimizer = CallbackSet([])
 
     def _exec_reduce_tied_grads(self):
         # We need to run this first to write to self.averaged_gradients;
@@ -289,7 +333,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.pipe_buffers[key].extend([None] * num_added)
         self.num_pipe_buffers = num_buffers
 
-    def train_batch(self, data_iter=None):
+    def train_batch(self, data_iter=None, return_loss: bool = True):
         """Progress the pipeline to train the next batch of data. The engine will ingest
         ``self.train_batch_size()`` total samples collectively across all workers.
 
@@ -332,8 +376,12 @@ class PipelineEngine(DeepSpeedEngine):
 
         
         self._exec_schedule(self.train_sched)
-        self.agg_train_loss = self._aggregate_total_loss()
-        self.timers('train_batch').stop()
+        if not return_loss:
+            self.timers('train_batch').stop()
+            return
+        else:
+            self.agg_train_loss = self._aggregate_total_loss()
+            self.timers('train_batch').stop()
 
         if self.global_steps % self.steps_per_print() == 0:
             if self.global_rank == 0:
@@ -357,8 +405,7 @@ class PipelineEngine(DeepSpeedEngine):
                 if self.global_steps % self.steps_per_print() == 0:
                     self.summary_writer.flush()
 
-        if self.wall_clock_breakdown(
-        ) and self.global_steps % self.steps_per_print() == 0 and mpu.get_data_parallel_rank()==0:
+        if self.print_details() and self.global_steps % self.steps_per_print() == 0 and mpu.get_data_parallel_rank() == 0:
             self.timers.log([
                 'pipe_send_output',
                 'pipe_send_grad',
@@ -625,26 +672,27 @@ class PipelineEngine(DeepSpeedEngine):
             if self._compute_loss and self.loss_model is not None:
                 labels = self.pipe_buffers['labels'][buffer_id]
                 # print(outputs.shape, labels.shape)
-                self.loss = self.loss_model(outputs, labels)
+                self.pipe_buffers["losses"][buffer_id] = self.loss_model(outputs, labels)
                 if self.return_logits and not self.do_train:
                     self.logits.append(outputs)
                     self.labels.append(labels)
             else:
                 # Some models just return loss from forward()
-                self.loss = outputs
+                self.pipe_buffers["losses"][buffer_id] = outputs
 
-            if isinstance(self.loss, torch.Tensor):
-                self.fwd_outputs.append(self.loss.detach())
+            loss = self.pipe_buffers["losses"][buffer_id]
+            if isinstance(loss, torch.Tensor):
+                self.fwd_outputs.append(loss.detach())
 
                 if self.total_loss is None:
-                    self.total_loss = torch.zeros_like(self.loss)
-                self.total_loss += self.loss.detach()
+                    self.total_loss = torch.zeros_like(loss)
+                self.total_loss += loss.detach()
             else:
-                self.fwd_outputs.append([l.detach() for l in self.loss])
+                self.fwd_outputs.append([l.detach() for l in loss])
 
                 if self.total_loss is None:
-                    self.total_loss = [torch.zeros_like(l) for l in self.loss]
-                for idx, l in enumerate(self.loss):
+                    self.total_loss = [torch.zeros_like(l) for l in loss]
+                for idx, l in enumerate(loss):
                     self.total_loss[idx] += l.detach()
 
     def _exec_backward_pass(self, buffer_id):
@@ -656,7 +704,11 @@ class PipelineEngine(DeepSpeedEngine):
         # The last stage just runs backward on the loss using DeepSpeed's typical
         # mechanisms.
         if self.is_last_stage():
-            super().backward(self.loss)
+            super().backward(self.pipe_buffers["losses"][buffer_id])
+            # Free up the output and loss buffers since we're done with backward.
+            if not self.is_profiling:
+                self.pipe_buffers["losses"][buffer_id] = None
+                self.pipe_buffers["outputs"][buffer_id] = None
             self.mem_status('AFTER BWD')
             return
 
@@ -678,16 +730,18 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers('backward_inner').start()
 
         # This handles either a single tensor or tuple of tensors.
+        # When we're profiling, we need to retain the computation graph so we can run backward passes back to back.
         if isinstance(outputs, tuple):
             out_tensors = [t for t in outputs if t.requires_grad]
             if not len(out_tensors) == len(grad_tensors):
                 grad_tensors = [grad_tensors[t] for t in range(len(outputs)) if outputs[t].requires_grad]
-            torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
+            torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors, retain_graph=self.is_profiling)
         else:
-            torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
+            torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ), retain_graph=self.is_profiling)
 
         # Free up the memory from the output of forward()
-        self.pipe_buffers['outputs'][buffer_id] = None
+        if not self.is_profiling:
+            self.pipe_buffers['outputs'][buffer_id] = None
         grad_tensors = None
 
         if self.wall_clock_breakdown():
@@ -873,7 +927,6 @@ class PipelineEngine(DeepSpeedEngine):
         if isinstance(inputs, torch.Tensor):
             assert inputs.grad is not None
             send_backward(inputs.grad)
-
         else:
             for idx, buffer in enumerate(inputs):
                 # Skip tensors that will not produce a grad
@@ -884,7 +937,8 @@ class PipelineEngine(DeepSpeedEngine):
                 send_backward(buffer.grad)
 
         # We can free up the input buffer now
-        self.pipe_buffers['inputs'][buffer_id] = None
+        if not self.is_profiling:
+            self.pipe_buffers['inputs'][buffer_id] = None
 
         if self.wall_clock_breakdown():
             self.timers('pipe_send_grad').stop()
@@ -993,6 +1047,8 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers('step_microstep').stop()
             self.timers('step').stop()
+
+        if self.print_details():
             if self.global_steps % self.steps_per_print() == 0:
                 self.timers.log([
                     'batch_input',
@@ -1330,22 +1386,27 @@ class PipelineEngine(DeepSpeedEngine):
 
     def _exec_schedule(self, pipe_schedule):
         # Reserve and reset buffers.
-        self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
+        num_buffers = pipe_schedule.num_pipe_buffers() if not self.is_profiling else 1
+        self._reserve_pipe_buffers(num_buffers)
         self.fwd_outputs = []
 
-        # For each step in the schedule
-        for step_cmds in pipe_schedule:
-            # print(self.global_rank, step_cmds)
-            # For each instruction in the step
-            for cmd in step_cmds:
-                if type(cmd) not in self._INSTRUCTION_MAP:
-                    raise RuntimeError(
-                        f'{self.__class__.__name__} does not understand instruction {repr(cmd)}'
-                    )
+        # A schedule gives instructions in one iteration.
+        self.perseus_optimizer.on_step_begin()
+        for cmd in chain.from_iterable(pipe_schedule):
+            # Set the GPU's frequency.
+            if isinstance(cmd, schedule.ForwardPass):
+                self.perseus_optimizer.on_instruction_begin("forward")
+            elif isinstance(cmd, schedule.BackwardPass):
+                self.perseus_optimizer.on_instruction_begin("backward")
 
-                # Equivalent to: self._exec_forward_pass(buffer_id=0)
-                self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
-                self._exec_instr(**cmd.kwargs)
+            # For example, this is equivalent to: self._exec_forward_pass(buffer_id=0).
+            self._INSTRUCTION_MAP[type(cmd)](self, **cmd.kwargs)
+
+            if isinstance(cmd, schedule.ForwardPass):
+                self.perseus_optimizer.on_instruction_end("forward")
+            elif isinstance(cmd, schedule.BackwardPass):
+                self.perseus_optimizer.on_instruction_end("backward")
+        self.perseus_optimizer.on_step_end()
 
     def set_batch_fn(self, fn):
         """Execute a post-processing function on input data.

@@ -1,86 +1,75 @@
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    BertConfig,
+    BertForMaskedLM,
+)
 
-def load_config(model_name):
-    if model_name == "gpt2":
-        config = {
-            'activation_function': 'gelu', 
-            'architectures': ['GPT2LMHeadModel'], 
-            'attn_pdrop': 0.1, 
-            'bos_token_id': 50256, 
-            'embd_pdrop': 0.1, 
-            'eos_token_id': 50256, 
-            'initializer_range': 0.02, 
-            'layer_norm_epsilon': 1e-05, 
-            'model_type': 'gpt2', 
-            "n_ctx": 1024,
-            'n_embd': 768, 
-            'n_head': 12, 
-            'n_layer': 12, 
-            'n_positions': 1024, 
-            'resid_pdrop': 0.1, 
-            'summary_activation': None, 
-            'summary_first_dropout': 0.1, 
-            'summary_proj_to_labels': True, 
-            'summary_type': 'cls_index', 
-            'summary_use_proj': True, 
-            'task_specific_params': {'text-generation': {'do_sample': True, 'max_length': 50}}, 
-            'vocab_size': 50344,
-            'return_dict': False,
-            'reorder_and_upcast_attn': True,
-            'use_cache': False
-            }
-    elif model_name == "t5-base":
-        config = {
-            'architectures': ['T5WithLMHeadModel'], 
-            'd_ff': 3072, 
-            'd_kv': 64, 
-            'd_model': 512, 
-            'decoder_start_token_id': 0, 
-            'dropout_rate': 0.1, 
-            'eos_token_id': 1, 
-            'initializer_factor': 1.0, 
-            'is_encoder_decoder': True, 
-            'layer_norm_epsilon': 1e-06, 
-            'model_type': 't5', 
-            'n_positions': 512, 
-            'num_heads': 16, 
-            'num_layers': 8, 
-            'output_past': True, 
-            'pad_token_id': 0, 
-            'relative_attention_num_buckets': 32, 
-            'task_specific_params': {'summarization': {'early_stopping': True, 'length_penalty': 2.0, 'max_length': 200, 'min_length': 30, 'no_repeat_ngram_size': 3, 'num_beams': 4, 'prefix': 'summarize: '}, 
-            'translation_en_to_de': {'early_stopping': True, 'max_length': 300, 'num_beams': 4, 'prefix': 'translate English to German: '}, 
-            'translation_en_to_fr': {'early_stopping': True, 'max_length': 300, 'num_beams': 4, 
-            'prefix': 'translate English to French: '}, 
-            'translation_en_to_ro': {'early_stopping': True, 'max_length': 300, 
-            'num_beams': 4, 
-            'prefix': 'translate English to Romanian: '}}, 
-            'vocab_size': 32128,
-            'use_cache': False,
-            'return_dict': False,
-            }
-    elif model_name == "bert-large-uncased":
-        config = {
-            'architectures': ['BertForMaskedLM'], 
-            'attention_probs_dropout_prob': 0.1, 
-            'gradient_checkpointing': False, 
-            'hidden_act': 'gelu', 
-            'hidden_dropout_prob': 0.1, 
-            'hidden_size': 1024, 
-            'initializer_range': 0.02, 
-            'intermediate_size': 4096, 
-            'layer_norm_eps': 1e-12, 
-            'max_position_embeddings': 512, 
-            'model_type': 'bert', 
-            'num_attention_heads': 16, 
-            'num_hidden_layers': 24, 
-            'pad_token_id': 0, 
-            'position_embedding_type': 'absolute', 
-            'type_vocab_size': 2, 
-            'use_cache': False, 
-            'vocab_size': 30522,
-            'return_dict': False,
-            } 
+def load_config_and_model(model_name: str):
+    if model_name.startswith("gpt3"):
+        return load_gpt3(model_name)
+    if model_name.startswith("bert"):
+        return load_bert(model_name)
+    raise NotImplementedError(f"Unknown model '{model_name}'")
+
+
+def load_gpt3(model_name: str):
+    config = GPT2Config.from_pretrained("gpt2")
+    config.use_cache = False
+    config.return_dict = False
+
+    if model_name == "gpt3-small":
+        config.n_embd = 768
+        config.n_layer = 12
+        config.n_head = 12
+    elif model_name == "gpt3-medium":
+        config.n_embd = 1024
+        config.n_layer = 24
+        config.n_head = 16
+    elif model_name == "gpt3-large":
+        config.n_embd = 1536
+        config.n_layer = 24
+        config.n_head = 16
+    elif model_name == "gpt3-xl":
+        config.n_embd = 2048
+        config.n_layer = 24
+        config.n_head = 16
+    elif model_name == "gpt3-2.7b":
+        config.n_embd = 2560
+        config.n_layer = 32
+        config.n_head = 32
+    elif model_name == "gpt3-6.7b":
+        config.n_embd = 4096
+        config.n_layer = 32
+        config.n_head = 32
+    elif model_name == "gpt3-13b":
+        config.n_embd = 5120
+        config.n_layer = 40
+        config.n_head = 40
+    elif model_name == "gpt3-175b":
+        config.n_embd = 12288
+        config.n_layer = 96
+        config.n_head = 96
     else:
-        raise ValueError(f"No {model_name} config")
+        raise NotImplementedError(
+            f"'{model_name}' is not a supported GPT3 variant.",
+        )
 
-    return config
+    model = GPT2LMHeadModel(config)
+    print(f"Loaded '{model_name}' with {count_parameters(model)/1e6:.2f}M parameters")
+
+    return config, model
+
+
+def load_bert(model_name: str):
+    config = BertConfig.from_pretrained(model_name)
+    config.return_dict = False
+
+    model = BertForMaskedLM(config)
+    print(f"Loaded '{model_name}' with {count_parameters(model)/1e6:.2f}M parameters")
+
+    return config, model
+
+
+def count_parameters(model) -> int:
+    return sum(p.numel() for p in model.parameters())

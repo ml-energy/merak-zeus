@@ -15,8 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Parts of the code here are adapted from https://github.com/joeljang/Pretraining_T5_custom_dataset/blob/master/pretrain.py
-# Parts of the code here are adapted from https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/models/t5/modeling_t5.py
 # Parts of the code here are adapted from https://github.com/huggingface/transformers/blob/v4.15.0/examples/pytorch/language-modeling/run_clm.py
 # Parts of the code here are adapted from https://github.com/huggingface/transformers/blob/v4.15.0/examples/pytorch/language-modeling/run_mlm.py
 
@@ -31,6 +29,18 @@ import math
 import numpy as np
 import os
 import torch.distributed as dist
+
+
+def load_wikitext(cache_dir, validation_split_percentage):
+    raw_datasets = load_dataset('wikitext', 'wikitext-103-raw-v1', cache_dir=cache_dir)
+    if "validation" not in raw_datasets.keys():
+        raw_datasets["validation"] = load_dataset(
+            'wikitext',
+            'wikitext-103-raw-v1',
+            split=f'train[:{validation_split_percentage}%]',
+            cache_dir=cache_dir
+        )
+    return raw_datasets
 
 # create dataset
 def load_data(data_path, cache_dir, validation_split_percentage):
@@ -90,13 +100,11 @@ def create_tokenizer(cache_dir, model_name, config):
     # Only rank 0 to download files
     if dist.get_rank() == 0:
         tokenizer = AutoTokenizer.from_pretrained(model_name, 
-            local_files_only=check_cache(cache_dir), 
             config=config,
             **tokenizer_kwargs)
     dist.barrier()
     if dist.get_rank() != 0:
         tokenizer = AutoTokenizer.from_pretrained(model_name, 
-            local_files_only=check_cache(cache_dir), 
             config=config,
             **tokenizer_kwargs)
     dist.barrier()
@@ -113,7 +121,7 @@ def preprocessing_datasets(datasets, tokenizer_func, model_name):
     # we tokenize every text, then concatenate them together before splitting them in smaller parts.
     # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
     # efficient when it receives the `special_tokens_mask`.
-    if model_name == 'bert-large-uncased':
+    if model_name.startswith("bert"):
         def tokenize_function(examples):
             return tokenizer_func(examples[text_column_name], return_special_tokens_mask=True)
     else:
@@ -131,7 +139,7 @@ def preprocessing_datasets(datasets, tokenizer_func, model_name):
 
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of
     # max_seq_length.
-    if model_name == 'bert-large-uncased':
+    if model_name.startswith("bert"):
         def group_texts(examples):
             # Concatenate all texts.
             concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
@@ -146,7 +154,7 @@ def preprocessing_datasets(datasets, tokenizer_func, model_name):
                 for k, t in concatenated_examples.items()
             }
             return result
-    elif model_name == 'gpt2':
+    elif model_name.startswith("gpt"):
         def group_texts(examples):
             # Concatenate all texts.
             concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
@@ -172,147 +180,3 @@ def preprocessing_datasets(datasets, tokenizer_func, model_name):
     )
 
     return lm_datasets['train'], lm_datasets['validation']
-
-
-class Prepare_data(Dataset):
-    def __init__(self, model, tokenizer, input_length, output_length, print_text=False):
-      self.dataset = self.split_into_segment(pd.read_csv("./train_context.csv"),input_length)
-      self.input_length = input_length
-      self.tokenizer = tokenizer
-      self.output_length = output_length
-      self.print_text = print_text
-      self.model = model
-
-    def split_into_segment(self, ds, input_length):
-        new_rows = []
-        for index, row in ds.iterrows():
-            if len(row['context'].split()) > input_length:
-                word_list = row['context'].split()
-                seg1 = word_list[:input_length]
-                segment1, seg2_a = (' '.join(seg1)).rsplit('.',1)
-                segment2 = seg2_a + (' '.join(word_list[input_length:]))
-                ds.loc[index, 'context'] = segment1
-                while(len(segment2.split()) > input_length):
-                    word_list = segment2.split()
-                    seg1_ = word_list[:input_length]
-                    if '.' in ' '.join(seg1_):
-                        segment1_, seg2_a_ = (' '.join(seg1_)).rsplit('.',1)
-                        segment2 = seg2_a_ + (' '.join(word_list[input_length:]))
-                    else:
-                        segment1_ = ' '.join(seg1_)
-                        segment2 = (' '.join(word_list[input_length:]))
-                    new_rows.append(segment1_)
-                new_rows.append(segment2)
-        ds2 = pd.DataFrame(new_rows, columns=['context'])
-        ds = ds.append(ds2)
-        return ds
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def clean_text(self, text):
-        text = text.replace('Example of text:', '')
-        text = text.replace('Example of Summary:', '')
-        text = text.replace('\n','')
-        text = text.replace('``', '')
-        text = text.replace('"', '')
-
-        return text
-
-    def span_corruption_mask(self, text, noise_span_length=3, noise_density=.15):
-        max_index = len(text.split())
-        mask = max_index * [0]
-        span_num = math.ceil(( max_index * noise_density ) / 3 )
-        exclude=[max_index-2, max_index-1]
-        for i in range(span_num):
-            while True:
-                rand_num = np.random.randint(low=0, high=max_index) #Getting random number for mask index
-                if rand_num not in exclude:
-                    span = [rand_num, rand_num+1, rand_num+2]
-                    for s in span:
-                        mask[s] = 1
-                        exclude.append(s)
-                    if rand_num==1:
-                        exclude.append(rand_num-1)
-                    elif rand_num==2:
-                        exclude.append(rand_num-1)
-                        exclude.append(rand_num-2)
-                    elif rand_num>2:
-                        exclude.append(rand_num-1)
-                        exclude.append(rand_num-2)
-                        exclude.append(rand_num-3)
-                    if not rand_num==max_index-3:
-                        exclude.append(span[-1]+1)
-                    break
-                else:
-                    continue
-        return mask
-
-    def noise_span_to_unique_sentinel(self, text, mask,sentinels):
-        tokens = text.split()
-        text_ = []
-        one_count=0
-        sentinel_cnt=0
-        for i in range(len(tokens)):
-            if mask[i] == 1:
-                one_count+=1
-                if one_count==1:
-                    text_.append(sentinels[sentinel_cnt])
-                    sentinel_cnt+=1
-                else:
-                    if one_count==3:
-                        one_count=0
-            else:
-                text_.append(tokens[i])
-        text_ = ' '.join(text_)
-        return text_
-
-    def nonnoise_span_to_unique_sentinel(self, text, mask,sentinels):
-        tokens = text.split()
-        text_ = []
-        zero_first=True
-        sentinel_cnt=0
-        for i in range(len(tokens)):
-            if mask[i] == 0:
-                if zero_first:
-                    text_.append(sentinels[sentinel_cnt])
-                    zero_first=False
-                    sentinel_cnt+=1
-            else:
-                zero_first=True
-                text_.append(tokens[i])
-        text_ = ' '.join(text_)
-        return text_
-
-    def convert_to_features(self, example_batch):
-        # Tokenize contexts and questions (as pairs of inputs)
-
-        if self.print_text:
-            print("Input Text: ", self.clean_text(example_batch['context']))
-        text = self.clean_text(example_batch['context'])
-        mask = self.span_corruption_mask(text)
-        sentinels=[]
-        for i in range(100):
-            sentinels.append(f'<extra_id_{i}>')
-        input_ = self.noise_span_to_unique_sentinel(text,mask,sentinels)
-        target_ = self.nonnoise_span_to_unique_sentinel(text,mask,sentinels)
-        source = self.tokenizer.batch_encode_plus([input_], max_length=self.input_length,
-                                                     padding='max_length', truncation=True, return_tensors="pt")
-
-        targets = self.tokenizer.batch_encode_plus([target_], max_length=self.output_length,
-                                                     padding='max_length', truncation=True, return_tensors="pt")
-
-        return source, targets
-
-    def __getitem__(self, index):
-        source, targets = self.convert_to_features(self.dataset.iloc[index])
-
-        source_ids = source["input_ids"].squeeze()
-        target_ids = targets["input_ids"].squeeze()
-
-        decoder_ids = self.model.prepare_decoder_input_ids_from_labels(target_ids)
-
-        src_mask    = source["attention_mask"].squeeze()
-        target_mask = targets["attention_mask"].squeeze()
-
-        return {"input_ids": source_ids, "decoder_attention_mask": src_mask, "decoder_input_ids": decoder_ids, "labels": target_ids, "target_mask": target_mask}

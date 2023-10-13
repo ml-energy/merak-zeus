@@ -5,6 +5,7 @@
 .idea
 .DS_Store
 .apex
+.envrc
 
 # compiled python files 
 *.pyc
@@ -43,6 +44,7 @@ tensorboard
 *.txt
 *.eps
 *.json
+*.csv
 *.onnx
 
 # shell script

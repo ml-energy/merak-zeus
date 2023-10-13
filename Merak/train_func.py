@@ -18,6 +18,7 @@
 # Parts of the code here are adapted from https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/trainer.py
 
 import torch
+import torch.distributed
 from transformers.trainer_utils import (
     TrainOutput,
     set_seed,
@@ -37,7 +38,10 @@ import os
 import warnings
 import sys
 import time
+import pynvml
 from . import mpu, print_rank_0
+
+from zeus.monitor import ZeusMonitor
 
 # Name of the files used for checkpointing
 TRAINING_ARGS_NAME = "training_args.bin"
@@ -212,7 +216,7 @@ def train(
         logger.info(f"  Num examples = {num_examples}")
         logger.info(f"  Num Epochs = {num_train_epochs}")
         logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size * self.dp}")
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_steps}")
 
@@ -250,6 +254,9 @@ def train(
             for _ in self.iter_dataloader:
                 break
 
+    # The ZeusMonitor meausres the GPU's time and energy consumption.
+    zeus_monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
+
     for epoch in range(epochs_trained, num_train_epochs):
         self._reset_dataloader(epoch)
         print_rank_0("Current processing of training epoch (%d/%d)" % (epoch + 1, num_train_epochs))
@@ -264,7 +271,12 @@ def train(
         self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
         
 
+        # A running variable to accumulate the energy consumption of each iteration.
+        energy_consumption = torch.zeros((1,), device=args.device)
+
         for step, _ in enumerate(epoch_iterator):
+            zeus_monitor.begin_window("step")
+
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
@@ -288,10 +300,17 @@ def train(
             self.state.global_step += 1
             self.state.epoch = epoch + (step + 1) / num_steps_per_epoch
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-                
-            if self.args.output_dir and self.args.save and self.state.global_step % self.args.save_steps == 0:
-                self.save_to_checkpoint()
+            
+            # Record iteration elapsed time and consumed energy
+            mes = zeus_monitor.end_window("step")
+            energy_consumption += mes.total_energy
+            if (step + 1) % args.num_prof_steps == 0:
+                torch.distributed.reduce(energy_consumption, dst=0)
+                print_rank_0(
+                    "Average iteration energy consumption: "
+                    f"{energy_consumption.item() / args.num_prof_steps:.3f} J"
+                )
+                energy_consumption.zero_()
 
 
             if self.control.should_epoch_stop or self.control.should_training_stop:
@@ -328,5 +347,8 @@ def train(
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
     else:
         metrics = None
+
+    # Doing this prevents potential CUDA errors during cleanup.
+    time.sleep(3.0)
 
     return TrainOutput(self.state.global_step, train_loss, metrics)

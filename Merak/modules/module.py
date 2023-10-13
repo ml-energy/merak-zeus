@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from .. import print_rank_0
-from ..utils import logger
+from ..utils import logger, get_args
 from . import utils as module_utils
 from ..runtime.checkpointing import checkpoint as checkpoint_func
 from ..autoshard.convert import add_inputs_to_shards
@@ -398,6 +398,47 @@ class PipelineModule(nn.Module):
             # print(param_counts)
             self.parts = module_utils.partition_balanced(weights=param_counts,
                                                      num_parts=num_stages)
+        elif method == "uniform_transformer":
+            args = get_args()
+            num_layers = len(self._layer_specs)
+            num_transformers = args.num_transformers
+            num_initial_embeddings = args.num_initial_embeddings
+            assert num_layers == args.shard_count, f"{num_layers=} != {args.shard_count=}"
+
+            # First, produces layer indices ignoring any embeddings before transformers.
+            parts = module_utils.partition_uniform(
+                num_items=num_transformers,
+                num_parts=num_stages,
+                use_ceil=True,
+            )
+
+            # All embedding layers go to the first stage. Offset every index by
+            # the number of embedding layers in the beginning, except for the first.
+            self.parts = list(map(lambda p: p + num_initial_embeddings, parts))
+            self.parts[0] = 0
+
+            # There are potentially other non-transformer layers in the end, e.g.
+            # LM heads for classifiers. Setting the last element to `num_layers` will
+            # automatically cover these.
+            self.parts[-1] = num_layers
+
+            print_rank_0(f"uniform_transformer ({num_layers=}, {num_initial_embeddings=}, {num_transformers=}): {self.parts}")
+
+        elif method.startswith('custom:'):
+            # Hardcode `parts` from a command line argument.
+            # For example, `--partition_method 'custom:0,7,14,21,28'` will set
+            # `parts` to `[0, 7, 14, 21, 28]`. This means that there are four stages,
+            # and each begins with the 0th, 7th, 14th, and 21st layer among 28 total layers.
+            layer_indices = method.split(':')[1]
+            self.parts = [int(x) for x in layer_indices.split(',')]
+            assert num_stages == len(self.parts) - 1, "For p stages, provide p + 1 integers"
+            # We can very well make the last integer implicit, but we just want to make sure
+            # the user knows what they're doing by making sure they know how many layers (GraphModules)
+            # there are to prevent mistakes.
+            assert (
+                self.parts[-1] == len(self._layer_specs)
+            ), f"The last integer should equal the total number of layers ({len(self._layer_specs)})"
+
         elif method == 'autopipe':
 
             # experimental partition method

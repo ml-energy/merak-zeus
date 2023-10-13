@@ -18,6 +18,7 @@
 # Parts of the code here are adapted from https://github.com/microsoft/DeepSpeed/blob/85acf14c58658964a796c5c901b58123f99fb1df/deepspeed/runtime/pipe/schedule.py
 
 from .utils import call_to_str
+from ..utils.merak_args import get_args
 
 from abc import ABC, abstractmethod
 
@@ -196,6 +197,47 @@ class InferenceSchedule(PipeSchedule):
             ``2``
         """
         return 2
+
+
+class ProfileSchedule(PipeSchedule):
+    """A schedule for profiling the time and energy consumption of each instruction."""
+
+    def steps(self):
+        """Dummy implementation to avoid ABC instantiation error."""
+        yield []
+
+    def num_pipe_buffers(self):
+        return 1
+
+    def buffer_fill_steps(self):
+        """Run one iteration to fill pipeline buffer 0 with tensors."""
+        cmds = []
+
+        if self.stage_id != 0:
+            cmds.append(RecvActivation(0))
+        if self.stage_id == 0 or self.stage_id == self.stages - 1:
+            cmds.append(LoadMicroBatch(0))
+        cmds.append(ForwardPass(0))
+        if self.stage_id != self.stages - 1:
+            cmds.append(SendActivation(0))
+
+        if self.stage_id != self.stages - 1:
+            cmds.append(RecvGrad(0))
+        cmds.append(BackwardPass(0))
+        if self.stage_id != 0:
+            cmds.append(SendGrad(0))
+
+        cmds.append(ReduceTiedGrads())
+        cmds.append(ReduceGrads())
+        cmds.append(OptimizerStep())
+
+        return [cmds]
+
+    def forward_steps(self, num_steps: int):
+        return [[ForwardPass(0)] * num_steps]
+
+    def backward_steps(self, num_steps: int):
+        return [[BackwardPass(0)] * num_steps]
 
 
 class TrainSchedule(PipeSchedule):
@@ -378,12 +420,8 @@ class MergeP2PTrainSchedule(TrainSchedule):
             yield cmds
 
 class PreRecomputeTrainSchedule(TrainSchedule):
-    """A schedule for training a batch using hybrid parallelism.
+    """Early recomputation schedule."""
 
-    Pipeline parallelism is extracted through gradient accumulation and thus
-    convergence follows that of a data parallel approach with the same batch
-    size.
-    """
     def steps(self):
         """"""
         prev_micro_batch_id = -1
@@ -548,12 +586,8 @@ class LastNoRecomputeTrainSchedule(TrainSchedule):
             yield cmds
 
 class FullCriticalPathTrainSchedule(TrainSchedule):
-    """A schedule for training a batch using hybrid parallelism.
+    """Shifted critical path schedule."""
 
-    Pipeline parallelism is extracted through gradient accumulation and thus
-    convergence follows that of a data parallel approach with the same batch
-    size.
-    """
     def steps(self):
         """"""
         prev_micro_batch_id = -1

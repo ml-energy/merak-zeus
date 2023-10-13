@@ -17,65 +17,63 @@
 
 # using our distributed trainer
 import Merak
-from Merak import MerakArguments, MerakTrainer, print_rank_0
-from utils import create_tokenizer, load_data, preprocessing_datasets
-from config import load_config
+from Merak import MerakArguments, MerakTrainer
+from utils import create_tokenizer, load_wikitext, preprocessing_datasets
+from config import load_config_and_model
 
 from transformers import (
     default_data_collator,
     set_seed,
     HfArgumentParser,
-    GPT2LMHeadModel,
-    GPT2Config,
 )
 
 
 def parse_option(parser):
     # easy config modification
-    parser.add_argument('--data-files', type=str, help='path to dataset')
-    parser.add_argument('--cache-dir', type=str, help='where to save cache')
-    parser.add_argument('--dataset-name', type=str, help='name of dataset from the datasets package')
-    parser.add_argument('--model-name', type=str, help='gpt2')
     parser.add_argument('--validation-split-percentage', type=int, default=5, help='split data for validation')
-
+    parser.add_argument('--pp', type=int, default=4, help='Pipeline parallel degree')
+    parser.add_argument('--tp', type=int, default=1, help='Tensor parallel degree')
+    parser.add_argument('--dp', type=int, default=1, help='Data parallel degree')
 
     return parser
 
 def main():
-    # init dist
-    pp = 2
-    tp = 2
-    dp = 1
-    Merak.init(pp, tp, dp)
-
     # merge args
     hfparser = HfArgumentParser(MerakArguments)
     parser = parse_option(hfparser)
     training_args, args = parser.parse_args_into_dataclasses()
 
+    # init dist
+    pp = args.pp
+    tp = args.tp
+    dp = args.dp
+    Merak.init(pp, tp, dp)
+
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
     # load data
-    raw_datasets = load_data(args.data_files, args.cache_dir, args.validation_split_percentage)
+    raw_datasets = load_wikitext(training_args.cache_dir, args.validation_split_percentage)
 
-    config_kwarg = load_config(args.model_name)
-    config = GPT2Config(
-            **config_kwarg
-        )
+    # Load model config and instantiate model.
+    config, model = load_config_and_model(training_args.model_name)
 
+    # Set shard_count based on number of layers
+    training_args.shard_count = 1 + 1 + config.n_layer + 1
+    training_args.num_transformers = config.n_layer
+    training_args.num_initial_embeddings = 2
 
     # create tokenizer
-    tokenizer = create_tokenizer(args.cache_dir, args.model_name, config)
-
-    # create model
-    model = GPT2LMHeadModel(config)
+    original_model_name = training_args.model_name
+    training_args.model_name = "gpt2"
+    tokenizer = create_tokenizer(training_args.cache_dir, training_args.model_name, config)
+    training_args.model_name = original_model_name
 
     # Preprocessing the datasets.
-    train_dataset, eval_dataset = preprocessing_datasets(raw_datasets, tokenizer, args.model_name)
+    train_dataset, eval_dataset = preprocessing_datasets(raw_datasets, tokenizer, training_args.model_name)
 
 
-    # Initialize our Trainer)
+    # Initialize our Trainer.
     trainer = MerakTrainer(
         model=model,
         args=training_args,
@@ -86,10 +84,14 @@ def main():
         data_collator=default_data_collator,
     )
 
-    # Training
-    train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    metrics = train_result.metrics
-    trainer.log_metrics("train", metrics)
+    # Train or profile
+    if training_args.profile:
+        trainer.profile()
+    else:
+        train_result = trainer.train()
+        if train_result is not None:
+            metrics = train_result.metrics
+            trainer.log_metrics("train", metrics)
 
 
 if __name__ == "__main__":

@@ -124,14 +124,27 @@ VOCABULARY_SIZE_DEFAULT = None
 #########################################
 # Wall block breakdown
 #########################################
-# Wall clock breakdown. By default, this feature is not enabled.
+# Wall clock breakdown. By default, this feature is enabled.
 # Users can configure in ds_config.json as below example:
 WALL_CLOCK_BREAKDOWN_FORMAT = '''
 Wall block breakdown should be enabled as:
 "wall_clock_breakdown": true
 '''
 WALL_CLOCK_BREAKDOWN = 'wall_clock_breakdown'
-WALL_CLOCK_BREAKDOWN_DEFAULT = False
+WALL_CLOCK_BREAKDOWN_DEFAULT = True
+
+
+#########################################
+# Print details
+#########################################
+# Print details. By default, this feature is not enabled.
+# Users can configure in ds_config.json as below example:
+PRINT_DETAILS_FORMAT = '''
+Print details should be enabled as:
+"print_details": true
+'''
+PRINT_DETAILS = 'print_details'
+PRINT_DETAILS_DEFAULT = False
 
 
 #########################################
@@ -296,6 +309,11 @@ def get_wall_clock_breakdown(param_dict):
     return get_scalar_param(param_dict,
                             WALL_CLOCK_BREAKDOWN,
                             WALL_CLOCK_BREAKDOWN_DEFAULT)
+
+def get_print_details(param_dict):
+    return get_scalar_param(param_dict,
+                            PRINT_DETAILS,
+                            PRINT_DETAILS_DEFAULT)
 
 def get_tensorboard_enabled(param_dict):
     if TENSORBOARD in param_dict.keys():
@@ -482,6 +500,7 @@ class DeepSpeedConfig(object):
 
         self.wall_clock_breakdown = get_wall_clock_breakdown(
               param_dict)
+        self.print_details = get_print_details(param_dict)
         self.tensorboard_enabled = get_tensorboard_enabled(param_dict)
         self.tensorboard_output_path = get_tensorboard_output_path(param_dict)
         self.tensorboard_job_name = get_tensorboard_job_name(param_dict)
