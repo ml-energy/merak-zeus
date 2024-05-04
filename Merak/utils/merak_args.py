@@ -138,7 +138,7 @@ class MerakArguments(TrainingArguments):
     -   hysteresis (int, defaults to 2) -- 'hysteresis is a fp16 parameter representing the delay shift in dynamic loss scaling.'
     -   min_loss_scale (int, defaults to 1) -- 'min_loss_scale is a fp16 parameter representing the minimum dynamic loss scale value.'
 
-    -   perseus_url (str, defaults to 'http://127.0.0.1:7787') -- 'Perseus server URL.'
+    -   pfo_server_url (str, defaults to 'http://127.0.0.1:7787') -- 'Pipeline frequency optimizer server URL.'
     -   model_name (str, defaults to '') -- 'Name of the DNN being trained.'
     -   num_warmup_steps (int, defaults to 5) -- 'How many warmup steps to run in profiling mode'
     -   num_prof_steps (int, defaults to 30) -- 'How many steps to measure'
@@ -296,9 +296,9 @@ class MerakArguments(TrainingArguments):
         default=1,
         metadata={"help": 'min_loss_scale is a fp16 parameter representing the minimum dynamic loss scale value.'}
     )
-    perseus_url: str = field(
+    pfo_server_url: str = field(
         default="http://localhost:7787",
-        metadata={"help": 'Perseus server URL'}
+        metadata={"help": 'Pipeline frequency optimizer server URL'}
     )
     model_name: str = field(
         default="",

@@ -32,7 +32,7 @@ import torch.optim as optim
 import torch.distributed as dist
 
 from zeus.callback import CallbackSet
-from zeus.optimizer.perseus import PerseusOptimizer
+from zeus.optimizer.pipeline_frequency import PipelineFrequencyOptimizer
 
 from ..utils.logging import logger
 from ..utils.timer import SynchronizedWallClockTimer, ThroughputTimer, set_timer_log_rank
@@ -267,7 +267,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers('step_microstep').start()
             self.timers('step_microstep').stop()
 
-        # The PerseusOptimizer communicates with ther server and helps set the
+        # The PipelineFrequencyOptimizer communicates with ther server and helps set the
         # GPU's frequency based on energy scheduling results.
         if not self.is_profiling:
             args = get_args()
@@ -279,7 +279,7 @@ class PipelineEngine(DeepSpeedEngine):
                     f"nmb{args.gradient_accumulation_steps}",
                 ]
             )
-            self.perseus_optimizer = PerseusOptimizer(
+            self.pipeline_frequency_optimizer = PipelineFrequencyOptimizer(
                 rank=self.global_rank,
                 dp_rank=self.grid.get_data_parallel_rank(),
                 pp_rank=self.grid.get_pipe_parallel_rank(),
@@ -289,12 +289,12 @@ class PipelineEngine(DeepSpeedEngine):
                 pp_degree=self.grid.get_pipe_parallel_world_size(),
                 tp_degree=self.grid.get_slice_parallel_world_size(),
                 world_size=dist.get_world_size(),
-                server_url=args.perseus_url,
+                server_url=args.pfo_server_url,
                 job_metadata=job_metadata,
             )
         else:
             # This is effectively a no-op.
-            self.perseus_optimizer = CallbackSet([])
+            self.pipeline_frequency_optimizer = CallbackSet([])
 
     def _exec_reduce_tied_grads(self):
         # We need to run this first to write to self.averaged_gradients;
@@ -1391,22 +1391,22 @@ class PipelineEngine(DeepSpeedEngine):
         self.fwd_outputs = []
 
         # A schedule gives instructions in one iteration.
-        self.perseus_optimizer.on_step_begin()
+        self.pipeline_frequency_optimizer.on_step_begin()
         for cmd in chain.from_iterable(pipe_schedule):
             # Set the GPU's frequency.
             if isinstance(cmd, schedule.ForwardPass):
-                self.perseus_optimizer.on_instruction_begin("forward")
+                self.pipeline_frequency_optimizer.on_instruction_begin("forward")
             elif isinstance(cmd, schedule.BackwardPass):
-                self.perseus_optimizer.on_instruction_begin("backward")
+                self.pipeline_frequency_optimizer.on_instruction_begin("backward")
 
             # For example, this is equivalent to: self._exec_forward_pass(buffer_id=0).
             self._INSTRUCTION_MAP[type(cmd)](self, **cmd.kwargs)
 
             if isinstance(cmd, schedule.ForwardPass):
-                self.perseus_optimizer.on_instruction_end("forward")
+                self.pipeline_frequency_optimizer.on_instruction_end("forward")
             elif isinstance(cmd, schedule.BackwardPass):
-                self.perseus_optimizer.on_instruction_end("backward")
-        self.perseus_optimizer.on_step_end()
+                self.pipeline_frequency_optimizer.on_instruction_end("backward")
+        self.pipeline_frequency_optimizer.on_step_end()
 
     def set_batch_fn(self, fn):
         """Execute a post-processing function on input data.

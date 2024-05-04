@@ -64,7 +64,7 @@ Notable command line arguments that `run.sh` accepts are:
 - `--profile`: Give `true` to run offline instruction profiling (which will invoke `MerakTrainer.profile` instead of `MerakTrainer.train`. When running profiling, the number of microbatches must be 1.
   - e.g. `bash run.sh gpt3-large 4 1 --profile true` will run offline profiling for microbatch size 4.
 - `--num_warmup_steps`: How many steps to warmup for offline instruction profiling.
-- `--num_prof_steps`: How many steps to measure for offline instruction profiling. When not profiling (i.e., training), how many steps to measure for the given `PowerStateSchedule` and report profiling results to the Perseus server.
+- `--num_prof_steps`: How many steps to measure for offline instruction profiling. When not profiling (i.e., training), how many steps to measure for the given `PowerStateSchedule` and report profiling results to the pipeline frequency optimizer server.
 - `--train_schedule`: Set to `early_recompute_1f1b` to use the alternative Merak 1F1B schedule that decouples activation recomputation and backward.
 
 Supported models and their sizes:
